@@ -117,6 +117,38 @@ pub const DPI_MIN: u16 = 100;
 pub const DPI_MAX: u16 = 25600;
 pub const DPI_STEP: u16 = 50;
 
+/// Value written for an unused slot (what the factory profiles use).
+pub const DPI_UNUSED: u16 = 0;
+
+/// Whether `slot` can be switched off: it must not be the default or shift slot.
+pub fn dpi_slot_locked(slot: usize, default_slot: u8, shift_slot: u8) -> bool {
+    slot == default_slot as usize || slot == shift_slot as usize
+}
+
+/// Rules for a DPI table we write: used values in range, used slots contiguous from
+/// slot 0 (so DPI cycling never hits a gap), and the default/shift slots used.
+pub fn validate_dpi_table(dpi: &[u16; 5], default_slot: u8, shift_slot: u8) -> Result<(), String> {
+    for (slot, &v) in dpi.iter().enumerate() {
+        if dpi_used(v) && !(DPI_MIN..=DPI_MAX).contains(&v) {
+            return Err(format!("DPI slot {slot}: must be between {DPI_MIN} and {DPI_MAX}"));
+        }
+    }
+    let used = dpi.iter().take_while(|&&v| dpi_used(v)).count();
+    if dpi[used..].iter().any(|&v| dpi_used(v)) {
+        return Err("Used DPI slots must be contiguous, starting at slot 0".into());
+    }
+    for (what, slot) in [("default", default_slot), ("shift", shift_slot)] {
+        if (slot as usize) < dpi.len() && !dpi_used(dpi[slot as usize]) {
+            return Err(format!("Slot {slot} is the {what} DPI slot and can't be unused"));
+        }
+    }
+    Ok(())
+}
+
+pub fn dpi_text(v: u16) -> String {
+    if dpi_used(v) { v.to_string() } else { "unused".into() }
+}
+
 /// Copy of a format 1-4 sector with the DPI table replaced and a fresh CRC.
 pub fn with_dpi(s: &[u8], dpi: &[u16; 5]) -> Vec<u8> {
     let mut buf = s.to_vec();
@@ -263,6 +295,17 @@ mod tests {
         let changed: Vec<usize> = (0..s.len()).filter(|&i| s[i] != new[i]).collect();
         assert!(changed.iter().all(|&i| (3..13).contains(&i) || i >= s.len() - 2), "{changed:?}");
         assert_eq!(with_dpi(&s, &[6400, 0, 0, 0, 0]), s);
+    }
+
+    #[test]
+    fn dpi_table_rules() {
+        assert!(validate_dpi_table(&[6400, 0, 0, 0, 0], 0, 0).is_ok());
+        assert!(validate_dpi_table(&[400, 800, 1600, 0, 0], 1, 0).is_ok());
+        assert!(validate_dpi_table(&[400, 800, 0xFFFF, 0, 0], 1, 0).is_ok());
+        assert!(validate_dpi_table(&[400, 0, 1600, 0, 0], 0, 0).is_err()); // gap
+        assert!(validate_dpi_table(&[400, 0, 0, 0, 0], 1, 0).is_err()); // default unused
+        assert!(validate_dpi_table(&[0, 0, 0, 0, 0], 0, 0).is_err());
+        assert!(validate_dpi_table(&[30000, 0, 0, 0, 0], 0, 0).is_err());
     }
 
     #[test]

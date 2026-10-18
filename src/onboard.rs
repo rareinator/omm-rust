@@ -235,9 +235,9 @@ pub enum WriteOutcome {
     DryRun { sector: u16, changes: Vec<DpiChange>, new_crc: u16, requests: usize },
 }
 
-/// Replace the DPI table of profile `sector`. The sector is re-read from the device,
-/// so edits are applied to its current contents, not to what the GUI showed.
-/// Slots that are unused on the device must stay unused.
+/// Replace the DPI table of profile `sector` (`DPI_UNUSED` marks a slot unused). The
+/// sector is re-read from the device, so edits are applied to its current contents,
+/// not to what the GUI showed. The result must pass `validate_dpi_table`.
 pub fn write_profile_dpi(sector: u16, dpi: [u16; 5], dry_run: bool) -> Result<WriteOutcome, String> {
     if sector == 0 || sector >= ROM_SECTOR_START {
         return Err(format!("Sector {sector:#06x} is not a writable profile sector"));
@@ -257,21 +257,12 @@ pub fn write_profile_dpi(sector: u16, dpi: [u16; 5], dry_run: bool) -> Result<Wr
         return Err(format!("Refusing to write: profile {sector}'s current CRC doesn't match"));
     }
 
-    let current = Profile::decode(&old, 0).ok_or("Sector is too short for the profile layout")?.dpi;
-    let mut changes = Vec::new();
-    for slot in 0..5 {
-        let (was, new) = (current[slot], dpi[slot]);
-        if was == new {
-            continue;
-        }
-        if !profile::dpi_used(was) {
-            return Err(format!("DPI slot {slot} is unused on the device; refusing to fill it"));
-        }
-        if !(profile::DPI_MIN..=profile::DPI_MAX).contains(&new) {
-            return Err(format!("DPI must be between {} and {}", profile::DPI_MIN, profile::DPI_MAX));
-        }
-        changes.push(DpiChange { slot, old: was, new });
-    }
+    let current = Profile::decode(&old, 0).ok_or("Sector is too short for the profile layout")?;
+    profile::validate_dpi_table(&dpi, current.default_dpi_slot, current.shift_dpi_slot)?;
+    let changes: Vec<DpiChange> = (0..5)
+        .filter(|&slot| current.dpi[slot] != dpi[slot])
+        .map(|slot| DpiChange { slot, old: current.dpi[slot], new: dpi[slot] })
+        .collect();
     if changes.is_empty() {
         return Ok(WriteOutcome::NoChange);
     }
@@ -369,14 +360,15 @@ mod tests {
     #[test]
     #[ignore]
     fn dpi_dry_run() {
-        let cases: [(u16, [u16; 5]); 5] = [
+        let cases: &[(u16, [u16; 5])] = &[
             (1, [3200, 0, 0, 0, 0]),       // change the one used slot
             (1, [6400, 0, 0, 0, 0]),       // no change
-            (1, [6400, 800, 0, 0, 0]),     // unused slot -> refused
-            (1, [30000, 0, 0, 0, 0]),      // out of range -> refused
-            (3, [500, 800, 1600, 3200, 25600]),
+            (1, [6400, 800, 1600, 0, 0]),  // enable slots 1 and 2
+            (1, [6400, 0, 800, 0, 0]),     // gap -> refused
+            (3, [400, 0, 0, 0, 0]),        // disable slots 2-4, but slot 1 is default -> refused
+            (3, [400, 800, 0, 0, 0]),      // disable slots 2-4
         ];
-        for (sector, dpi) in cases {
+        for &(sector, dpi) in cases {
             println!("{sector} {dpi:?}: {:?}", super::write_profile_dpi(sector, dpi, true));
         }
     }

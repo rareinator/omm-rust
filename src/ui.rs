@@ -5,7 +5,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::onboard::{self, ProfileSector, Snapshot, SwitchOutcome, WriteOutcome};
-use crate::profile::{self, DPI_MAX, DPI_MIN, DPI_STEP, Profile, decode_button, dpi_used, hex};
+use crate::profile::{self, DPI_MAX, DPI_MIN, DPI_STEP, Profile, decode_button, dpi_text, dpi_used, hex};
 
 const DEVICE_PAGE: &str = "device";
 
@@ -204,13 +204,13 @@ fn write_dpi(ui: &Rc<Ui>, sector: u16, dpi: [u16; 5]) {
 }
 
 fn summarize(changes: &[onboard::DpiChange]) -> String {
-    changes.iter().map(|c| format!("slot {} {} → {}", c.slot, c.old, c.new)).collect::<Vec<_>>().join(", ")
+    changes.iter().map(|c| format!("slot {} {} → {}", c.slot, dpi_text(c.old), dpi_text(c.new))).collect::<Vec<_>>().join(", ")
 }
 
 fn confirm_dpi_write(ui: &Rc<Ui>, parent: &gtk::Widget, sector: u16, original: [u16; 5], dpi: [u16; 5]) {
     let changes: Vec<String> = (0..5)
         .filter(|&i| original[i] != dpi[i])
-        .map(|i| format!("Slot {i}: {} → {}", original[i], dpi[i]))
+        .map(|i| format!("Slot {i}: {} → {}", dpi_text(original[i]), dpi_text(dpi[i])))
         .collect();
     let note = if ui.dry_run {
         "Dry run: nothing will be written."
@@ -400,10 +400,25 @@ fn activate_button(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> Option<gtk::
     Some(button)
 }
 
-/// DPI slots as sliders. Edits stay local until Apply; unused slots are read-only.
+struct SlotRow {
+    switch: gtk::Switch,
+    adj: gtk::Adjustment,
+    scale: gtk::Scale,
+    spin: gtk::SpinButton,
+    row: adw::ActionRow,
+    tags: String,
+}
+
+/// Initial slider position for a slot: its own value, else the nearest used slot before it.
+fn slider_start(dpi: &[u16; 5], slot: usize) -> u16 {
+    (0..=slot).rev().map(|i| dpi[i]).find(|&v| dpi_used(v)).unwrap_or(800).clamp(DPI_MIN, DPI_MAX)
+}
+
+/// DPI slots with an on/off switch and a slider each. Edits stay local until Apply.
 fn dpi_group(ui: &Rc<Ui>, sector: u16, prof: &Profile) -> adw::PreferencesGroup {
     let g = group("DPI");
     let original = prof.dpi;
+    let (default_slot, shift_slot) = (prof.default_dpi_slot, prof.shift_dpi_slot);
     let edited = Rc::new(Cell::new(original));
 
     let revert = gtk::Button::builder()
@@ -424,47 +439,95 @@ fn dpi_group(ui: &Rc<Ui>, sector: u16, prof: &Profile) -> adw::PreferencesGroup 
     header.append(&apply);
     g.set_header_suffix(Some(&header));
 
-    let mut adjustments = Vec::new();
-    for (slot, &v) in original.iter().enumerate() {
-        let mut tags = Vec::new();
-        if slot == prof.default_dpi_slot as usize {
-            tags.push("Default");
-        }
-        if slot == prof.shift_dpi_slot as usize {
-            tags.push("Shift");
-        }
-        let title = format!("Slot {slot}");
-        if !dpi_used(v) {
-            let value = if tags.is_empty() { "Unused".into() } else { format!("Unused ({})", tags.join(", ")) };
-            g.add(&info_row(&title, &value));
-            continue;
-        }
+    let rows: Rc<Vec<SlotRow>> = Rc::new(
+        (0..5)
+            .map(|slot| {
+                let mut tags = Vec::new();
+                if slot == default_slot as usize {
+                    tags.push("Default");
+                }
+                if slot == shift_slot as usize {
+                    tags.push("Shift");
+                }
+                let start = slider_start(&original, slot) as f64;
+                let adj = gtk::Adjustment::new(start, DPI_MIN as f64, DPI_MAX as f64, DPI_STEP as f64, 400.0, 0.0);
+                let scale = gtk::Scale::builder()
+                    .adjustment(&adj)
+                    .hexpand(true)
+                    .width_request(140)
+                    .valign(gtk::Align::Center)
+                    .build();
+                let spin = gtk::SpinButton::builder()
+                    .adjustment(&adj)
+                    .numeric(true)
+                    .width_chars(5)
+                    .valign(gtk::Align::Center)
+                    .build();
+                let switch = gtk::Switch::builder().active(dpi_used(original[slot])).valign(gtk::Align::Center).build();
+                let row = adw::ActionRow::builder().title(format!("Slot {slot}")).use_markup(false).build();
+                row.add_prefix(&switch);
+                row.add_suffix(&scale);
+                row.add_suffix(&spin);
+                g.add(&row);
+                SlotRow { switch, adj, scale, spin, row, tags: tags.join(", ") }
+            })
+            .collect(),
+    );
 
-        let adj = gtk::Adjustment::new(v as f64, DPI_MIN as f64, DPI_MAX as f64, DPI_STEP as f64, 400.0, 0.0);
-        let scale = gtk::Scale::builder()
-            .adjustment(&adj)
-            .hexpand(true)
-            .width_request(140)
-            .valign(gtk::Align::Center)
-            .build();
-        let spin = gtk::SpinButton::builder()
-            .adjustment(&adj)
-            .numeric(true)
-            .width_chars(5)
-            .valign(gtk::Align::Center)
-            .build();
-        let row = adw::ActionRow::builder().title(&title).subtitle(tags.join(", ")).use_markup(false).build();
-        row.add_suffix(&scale);
-        row.add_suffix(&spin);
-        g.add(&row);
+    // Recompute which switches may flip, the rows' state and the Apply/Revert buttons.
+    let sync = Rc::new(glib::clone!(
+        #[strong]
+        edited,
+        #[weak]
+        apply,
+        #[weak]
+        revert,
+        #[weak]
+        rows,
+        move || {
+            let dpi = edited.get();
+            for (slot, r) in rows.iter().enumerate() {
+                let on = dpi_used(dpi[slot]);
+                let locked = profile::dpi_slot_locked(slot, default_slot, shift_slot);
+                let (can_flip, why) = if on {
+                    if locked {
+                        (false, "The default and shift slots can't be turned off")
+                    } else if slot + 1 < 5 && dpi_used(dpi[slot + 1]) {
+                        (false, "Turn off the later slots first; used slots must be contiguous")
+                    } else {
+                        (true, "Mark this slot unused")
+                    }
+                } else if slot > 0 && !dpi_used(dpi[slot - 1]) {
+                    (false, "Turn on the earlier slots first; used slots must be contiguous")
+                } else {
+                    (true, "Use this slot")
+                };
+                r.switch.set_sensitive(can_flip);
+                r.switch.set_tooltip_text(Some(why));
+                r.scale.set_sensitive(on);
+                r.spin.set_sensitive(on);
+                let subtitle = match (on, r.tags.is_empty()) {
+                    (true, _) => r.tags.clone(),
+                    (false, true) => "Unused".into(),
+                    (false, false) => format!("Unused ({})", r.tags),
+                };
+                r.row.set_subtitle(&subtitle);
+            }
+            let changed = dpi != original;
+            let valid = profile::validate_dpi_table(&dpi, default_slot, shift_slot).is_ok();
+            apply.set_sensitive(changed && valid);
+            revert.set_sensitive(changed);
+        }
+    ));
 
-        adj.connect_value_changed(glib::clone!(
+    for (slot, r) in rows.iter().enumerate() {
+        r.adj.connect_value_changed(glib::clone!(
             #[strong]
             edited,
-            #[weak]
-            apply,
-            #[weak]
-            revert,
+            #[strong]
+            sync,
+            #[weak(rename_to = switch)]
+            r.switch,
             move |adj| {
                 let step = DPI_STEP as f64;
                 let snapped = (adj.value() / step).round() * step;
@@ -472,22 +535,46 @@ fn dpi_group(ui: &Rc<Ui>, sector: u16, prof: &Profile) -> adw::PreferencesGroup 
                     adj.set_value(snapped); // re-enters with the snapped value
                     return;
                 }
-                let mut dpi = edited.get();
-                dpi[slot] = snapped as u16;
-                edited.set(dpi);
-                let changed = dpi != original;
-                apply.set_sensitive(changed);
-                revert.set_sensitive(changed);
+                if switch.is_active() {
+                    let mut dpi = edited.get();
+                    dpi[slot] = snapped as u16;
+                    edited.set(dpi);
+                }
+                sync();
             }
         ));
-        adjustments.push((slot, adj));
+        r.switch.connect_active_notify(glib::clone!(
+            #[strong]
+            edited,
+            #[strong]
+            sync,
+            #[weak(rename_to = adj)]
+            r.adj,
+            move |switch| {
+                let mut dpi = edited.get();
+                dpi[slot] = match (switch.is_active(), dpi_used(original[slot])) {
+                    (true, _) => adj.value() as u16,
+                    (false, false) => original[slot], // keep the device's own unused marker
+                    (false, true) => profile::DPI_UNUSED,
+                };
+                edited.set(dpi);
+                sync();
+            }
+        ));
     }
+    sync();
 
-    revert.connect_clicked(move |_| {
-        for (slot, adj) in &adjustments {
-            adj.set_value(original[*slot] as f64);
+    revert.connect_clicked(glib::clone!(
+        #[strong]
+        rows,
+        move |_| {
+            // Slider first: turning a slot on copies the slider into the edited table
+            for (slot, r) in rows.iter().enumerate() {
+                r.adj.set_value(slider_start(&original, slot) as f64);
+                r.switch.set_active(dpi_used(original[slot]));
+            }
         }
-    });
+    ));
     apply.connect_clicked(glib::clone!(
         #[strong]
         ui,
