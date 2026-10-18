@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::onboard::{self, ProfileSector, Snapshot, SwitchOutcome, WriteOutcome};
+use crate::onboard::{self, CopyOutcome, ProfileSector, Snapshot, SwitchOutcome, WriteOutcome};
 use crate::profile::{self, DPI_MAX, DPI_MIN, DPI_STEP, Profile, decode_button, dpi_text, dpi_used, hex};
 
 const DEVICE_PAGE: &str = "device";
@@ -201,6 +201,121 @@ fn write_dpi(ui: &Rc<Ui>, sector: u16, dpi: [u16; 5]) {
             ));
         }
     });
+}
+
+/// Copy one profile over another (optionally enabling it), then re-read the device.
+fn copy_profile(ui: &Rc<Ui>, source: u16, target: u16, enable: bool) {
+    let dry_run = ui.dry_run;
+    run_op(ui, move || onboard::copy_profile(source, target, enable, dry_run), |ui, outcome| match outcome {
+        CopyOutcome::NoChange => ui.toast("Nothing to do: the profiles are already identical"),
+        CopyOutcome::Copied { source, target, backups, enabled, reactivated } => {
+            let mut done = vec![format!("Copied profile {source} into profile {target}")];
+            if enabled {
+                done.push(format!("enabled profile {target}"));
+            }
+            if reactivated {
+                done.push("reloaded it".into());
+            }
+            let names: Vec<String> =
+                backups.iter().map(|b| b.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+            ui.toast(&format!("{}. Backups: {}", done.join(", "), names.join(", ")));
+            refresh(ui);
+        }
+        CopyOutcome::DryRun { source, target, copy, enable, requests } => {
+            let mut plan = Vec::new();
+            if copy {
+                plan.push(format!("copy profile {source} into profile {target}"));
+            }
+            if enable {
+                plan.push(format!("enable profile {target}"));
+            }
+            ui.toast(&format!("Dry run: would {}; {requests} write requests not sent", plan.join(" and ")));
+        }
+    });
+}
+
+fn profile_label(s: &Snapshot, p: &ProfileSector) -> String {
+    let sector = p.entry.sector;
+    let name = p.profile.as_ref().and_then(|p| p.name.clone()).unwrap_or_else(|| format!("Profile {sector}"));
+    let state = if sector == s.active_sector { "active" } else if p.entry.enabled() { "enabled" } else { "disabled" };
+    let dpi: Vec<String> = p
+        .profile
+        .iter()
+        .flat_map(|p| p.dpi)
+        .filter(|&v| dpi_used(v))
+        .map(|v| v.to_string())
+        .collect();
+    format!("{name} ({state}, DPI {})", dpi.join("/"))
+}
+
+/// "Copy From…" button: overwrite this profile with another valid one.
+fn copy_button(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> gtk::Button {
+    let target = p.entry.sector;
+    let target_enabled = p.entry.enabled();
+    let sources: Vec<(u16, String)> = s
+        .profiles
+        .iter()
+        .filter(|o| o.entry.sector != target && o.crc_ok)
+        .map(|o| (o.entry.sector, profile_label(s, o)))
+        .collect();
+    let button = gtk::Button::builder()
+        .label("Copy From…")
+        .valign(gtk::Align::Center)
+        .sensitive(!sources.is_empty())
+        .tooltip_text(if sources.is_empty() {
+            "No other profile has valid data"
+        } else {
+            "Replace this profile with a copy of another one"
+        })
+        .build();
+    button.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |button| confirm_copy(&ui, button.upcast_ref(), &sources, target, target_enabled)
+    ));
+    button
+}
+
+fn confirm_copy(ui: &Rc<Ui>, parent: &gtk::Widget, sources: &[(u16, String)], target: u16, target_enabled: bool) {
+    let labels: Vec<&str> = sources.iter().map(|(_, l)| l.as_str()).collect();
+    let source_pick = gtk::DropDown::from_strings(&labels);
+    let enable = gtk::CheckButton::builder()
+        .label(format!("Also enable profile {target}"))
+        .active(true)
+        .visible(!target_enabled)
+        .build();
+    let extra = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    extra.append(&source_pick);
+    extra.append(&enable);
+
+    let note = if ui.dry_run {
+        "Dry run: nothing will be written."
+    } else {
+        "This writes to the mouse's flash memory. Backups of every changed sector are saved first."
+    };
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Copy Into Profile {target}?")),
+        Some(&format!(
+            "Everything in profile {target} (DPI, buttons and other settings) is replaced by the profile chosen below.\n\n{note}"
+        )),
+    );
+    dialog.set_extra_child(Some(&extra));
+    dialog.add_responses(&[("cancel", "Cancel"), ("copy", "Copy")]);
+    dialog.set_response_appearance("copy", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let sectors: Vec<u16> = sources.iter().map(|(n, _)| *n).collect();
+    dialog.connect_response(Some("copy"), glib::clone!(
+        #[strong]
+        ui,
+        move |_, _| {
+            let Some(&source) = sectors.get(source_pick.selected() as usize) else {
+                return;
+            };
+            copy_profile(&ui, source, target, !target_enabled && enable.is_active());
+        }
+    ));
+    dialog.present(Some(parent));
 }
 
 fn summarize(changes: &[onboard::DpiChange]) -> String {
@@ -595,9 +710,12 @@ fn profile_page(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> adw::Preference
         (false, true) => "Enabled",
         (false, false) => "Disabled",
     };
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    actions.append(&copy_button(ui, s, p));
     if let Some(button) = activate_button(ui, s, p) {
-        overview.set_header_suffix(Some(&button));
+        actions.append(&button);
     }
+    overview.set_header_suffix(Some(&actions));
     overview.add(&info_row("State", state));
     overview.add(&info_row("Sector", &format!("{sector:#06x}")));
     overview.add(&info_row(

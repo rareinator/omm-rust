@@ -2,7 +2,7 @@
 //!
 //! Reads use GetInfo, GetMode, GetActiveProfile and Read. State changes:
 //! - SetActiveProfile (`set_active_profile`): immediate, no flash write.
-//! - Sector writes (`write_profile_dpi`): StartWrite / WriteData / EndWrite, following
+//! - Sector writes (`write_profile_dpi`, `copy_profile`): StartWrite / WriteData / EndWrite, following
 //!   the rules in HIDPP_PROTOCOL.md section 8 (whole sector, valid CRC, backup first,
 //!   read-back verify, never ROM sectors).
 
@@ -276,21 +276,109 @@ pub fn write_profile_dpi(sector: u16, dpi: [u16; 5], dry_run: bool) -> Result<Wr
             requests: write_request_count(new.len()),
         });
     }
-    let backup = save_backup(sector, &old)?;
-    write_sector(&mut h, idx, sector, &new)?;
-    let readback = read_sector(&mut h, idx, sector, info.sector_size).map_err(err("Read-back"))?;
+    let backup = commit(&mut h, idx, sector, &old, &new)?;
+    let reactivated = reload_if_active(&mut h, idx, sector)?;
+    Ok(WriteOutcome::Written { sector, changes, backup, reactivated })
+}
+
+/// Back up `old`, write `new` to `sector`, verify by read-back. Returns the backup path.
+fn commit(h: &mut Hidpp, idx: u8, sector: u16, old: &[u8], new: &[u8]) -> Result<PathBuf, String> {
+    let backup = save_backup(sector, old)?;
+    write_sector(h, idx, sector, new)?;
+    let readback = read_sector(h, idx, sector, new.len() as u16).map_err(err("Read-back"))?;
     if readback != new {
         return Err(format!(
-            "Read-back of profile {sector} does not match what was written! Backup: {}",
+            "Read-back of sector {sector:#06x} does not match what was written! Backup: {}",
             backup.display()
         ));
     }
-    // Re-select the active profile so the mouse reloads it from memory
-    let reactivated = get_active(&mut h, idx)? == sector;
-    if reactivated {
+    Ok(backup)
+}
+
+/// Re-select `sector` if it is the active profile, so the mouse reloads it from memory.
+fn reload_if_active(h: &mut Hidpp, idx: u8, sector: u16) -> Result<bool, String> {
+    let active = get_active(h, idx)? == sector;
+    if active {
         h.request(idx, F_SET_ACTIVE, &sector.to_be_bytes()).map_err(err("SetActiveProfile"))?;
     }
-    Ok(WriteOutcome::Written { sector, changes, backup, reactivated })
+    Ok(active)
+}
+
+#[derive(Debug, Clone)]
+pub enum CopyOutcome {
+    NoChange,
+    Copied {
+        source: u16,
+        target: u16,
+        /// Backup of the target sector; the directory backup too if it was rewritten.
+        backups: Vec<PathBuf>,
+        enabled: bool,
+        reactivated: bool,
+    },
+    /// Nothing was sent or saved.
+    DryRun { source: u16, target: u16, copy: bool, enable: bool, requests: usize },
+}
+
+/// Copy profile `source` over profile `target`, and optionally enable `target` in the
+/// directory. Both sectors are re-read from the device first; the source must have a
+/// valid CRC. The target sector is written and verified before the directory is touched.
+pub fn copy_profile(source: u16, target: u16, enable_target: bool, dry_run: bool) -> Result<CopyOutcome, String> {
+    if source == target {
+        return Err("Source and target are the same profile".into());
+    }
+    if target == 0 || target >= ROM_SECTOR_START {
+        return Err(format!("Sector {target:#06x} is not a writable profile sector"));
+    }
+    let (mut h, _, _, idx) = open()?;
+    let info = read_info(&mut h, idx).map_err(err("GetInfo"))?;
+    let size = info.sector_size;
+    let directory = read_sector(&mut h, idx, 0x0000, size).map_err(err("Read directory"))?;
+    let entries = profile::parse_directory(&directory);
+    let entry_of = |n: u16| {
+        entries.iter().position(|e| e.sector == n).ok_or_else(|| format!("Profile {n} is not in the profile directory"))
+    };
+    entry_of(source)?;
+    let target_pos = entry_of(target)?;
+
+    let data = read_sector(&mut h, idx, source, size).map_err(err(&format!("Read profile {source}")))?;
+    if !profile::crc_ok(&data) {
+        return Err(format!("Refusing to copy: profile {source}'s CRC doesn't match"));
+    }
+    let old_target = read_sector(&mut h, idx, target, size).map_err(err(&format!("Read profile {target}")))?;
+
+    let copy = old_target != data;
+    let enable = enable_target && !entries[target_pos].enabled();
+    let new_dir = if enable {
+        if !profile::crc_ok(&directory) {
+            return Err("Refusing to rewrite the directory: its current CRC doesn't match".into());
+        }
+        // Only rewrite a directory we can reproduce exactly; anything else has bytes we'd lose
+        if profile::build_directory(&entries, size as usize)? != directory {
+            return Err("Refusing to rewrite the directory: it has data this tool doesn't understand".into());
+        }
+        let mut new_entries = entries.clone();
+        new_entries[target_pos] = profile::enabled_entry(new_entries[target_pos]);
+        Some(profile::build_directory(&new_entries, size as usize)?)
+    } else {
+        None
+    };
+    if !copy && !enable {
+        return Ok(CopyOutcome::NoChange);
+    }
+
+    if dry_run {
+        let requests = [copy, enable].iter().filter(|&&w| w).count() * write_request_count(size as usize);
+        return Ok(CopyOutcome::DryRun { source, target, copy, enable, requests });
+    }
+    let mut backups = Vec::new();
+    if copy {
+        backups.push(commit(&mut h, idx, target, &old_target, &data)?);
+    }
+    if let Some(new_dir) = new_dir {
+        backups.push(commit(&mut h, idx, 0x0000, &directory, &new_dir)?);
+    }
+    let reactivated = copy && reload_if_active(&mut h, idx, target)?;
+    Ok(CopyOutcome::Copied { source, target, backups, enabled: enable, reactivated })
 }
 
 /// Find the mouse, then read info, mode, active profile, the directory and every
@@ -353,6 +441,15 @@ mod tests {
     fn switch_dry_run() {
         for sector in [1, 2, 3, 99] {
             println!("{sector}: {:?}", super::set_active_profile(sector, true));
+        }
+    }
+
+    /// Dry run only: validates copies against the real mouse but writes nothing.
+    #[test]
+    #[ignore]
+    fn copy_dry_run() {
+        for (source, target, enable) in [(1, 3, true), (1, 3, false), (3, 4, false), (2, 2, true), (1, 99, true)] {
+            println!("{source}->{target} enable={enable}: {:?}", super::copy_profile(source, target, enable, true));
         }
     }
 

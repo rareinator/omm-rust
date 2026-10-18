@@ -43,6 +43,33 @@ pub fn parse_directory(d: &[u8]) -> Vec<DirEntry> {
         .collect()
 }
 
+/// Rebuild the directory the way FUN_1800da3e0 does: 0xFF fill, entries, 0xFFFF, CRC.
+pub fn build_directory(entries: &[DirEntry], size: usize) -> Result<Vec<u8>, String> {
+    if entries.len() * 4 + 2 > size.saturating_sub(2) {
+        return Err("Directory exceeds the sector size".into());
+    }
+    if !entries.iter().any(DirEntry::enabled) {
+        return Err("The directory must have at least one enabled profile".into());
+    }
+    let mut buf = vec![0xFFu8; size];
+    for (i, e) in entries.iter().enumerate() {
+        buf[i * 4..i * 4 + 2].copy_from_slice(&e.sector.to_be_bytes());
+        buf[i * 4 + 2] = e.flags;
+        buf[i * 4 + 3] = e.extra;
+    }
+    let n = entries.len() * 4;
+    buf[n..n + 2].copy_from_slice(&[0xFF, 0xFF]);
+    let crc = crc16_ccitt(&buf[..size - 2]);
+    buf[size - 2..].copy_from_slice(&crc.to_be_bytes());
+    Ok(buf)
+}
+
+/// `entry` with the enabled bit set; enabled entries on the Superlight carry extra 0x00.
+pub fn enabled_entry(entry: DirEntry) -> DirEntry {
+    let extra = if entry.extra == 0xFF { 0x00 } else { entry.extra };
+    DirEntry { flags: entry.flags | 1, extra, ..entry }
+}
+
 pub fn is_supported_format(format: u8) -> bool {
     (1..=4).contains(&format)
 }
@@ -318,6 +345,18 @@ mod tests {
         assert_eq!(e.len(), 5);
         assert!(e[0].enabled() && !e[1].enabled());
         assert_eq!(e[4].sector, 5);
+
+        // Rebuilding reproduces the shipped directory (section 3.6), CRC included
+        let crc = crc16_ccitt(&d[..253]);
+        d[253..].copy_from_slice(&crc.to_be_bytes());
+        assert_eq!(build_directory(&e, 255).unwrap(), d);
+
+        let mut enabled = e.clone();
+        enabled[2] = enabled_entry(enabled[2]);
+        assert_eq!(enabled[2], DirEntry { sector: 3, flags: 1, extra: 0 });
+        assert!(crc_ok(&build_directory(&enabled, 255).unwrap()));
+        let none: Vec<DirEntry> = e.iter().map(|x| DirEntry { flags: 0, ..*x }).collect();
+        assert!(build_directory(&none, 255).is_err());
     }
 
     #[test]
