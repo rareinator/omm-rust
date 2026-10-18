@@ -190,13 +190,13 @@ fn write_request_count(len: usize) -> usize {
     len.div_ceil(16) + 2
 }
 
-/// `$XDG_STATE_HOME/omm-gui/backups`, falling back to `~/.local/state/omm-gui/backups`.
+/// `$XDG_STATE_HOME/omm-rust/backups`, falling back to `~/.local/state/omm-rust/backups`.
 pub fn backup_dir() -> PathBuf {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    state.join("omm-gui/backups")
+    state.join("omm-rust/backups")
 }
 
 /// Local time as YYYYmmdd-HHMMSS, the same format hidpp_read_profile.py uses.

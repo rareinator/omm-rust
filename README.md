@@ -1,4 +1,4 @@
-# omm-gui
+# omm-rust
 
 A native Linux GUI for editing the **onboard memory** of Logitech HID++ 2.0 mice:
 DPI, button mappings and profiles. Settings live on the mouse, so they still apply
@@ -62,13 +62,13 @@ sudo dnf install cargo gtk4-devel libadwaita-devel
 ## Building and running
 
 ```sh
-git clone https://github.com/rareinator/omm-rust/tree/main
-cd omm-gui
+git clone https://github.com/rareinator/omm-rust.git
+cd omm-rust
 cargo run --release                # normal mode
 cargo run --release -- --dry-run   # validate changes, send nothing
 ```
 
-The binary ends up at `target/release/omm-gui`.
+The binary ends up at `target/release/omm-rust`.
 
 ### Permissions
 
@@ -120,7 +120,7 @@ slider.
 Before each write, the old sector is saved to:
 
 ```
-~/.local/state/omm-gui/backups/profile_sectorNN_backup_YYYYmmdd-HHMMSS.bin
+~/.local/state/omm-rust/backups/profile_sectorNN_backup_YYYYmmdd-HHMMSS.bin
 ```
 
 `$XDG_STATE_HOME` is respected. `NN` is the sector number in hex (`00` is the

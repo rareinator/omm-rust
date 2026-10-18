@@ -444,7 +444,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "omm-gui"
+name = "omm-rust"
 version = "0.1.0"
 dependencies = [
  "gtk4",
