@@ -64,10 +64,15 @@ pub fn build_directory(entries: &[DirEntry], size: usize) -> Result<Vec<u8>, Str
     Ok(buf)
 }
 
-/// `entry` with the enabled bit set; enabled entries on the Superlight carry extra 0x00.
-pub fn enabled_entry(entry: DirEntry) -> DirEntry {
-    let extra = if entry.extra == 0xFF { 0x00 } else { entry.extra };
-    DirEntry { flags: entry.flags | 1, extra, ..entry }
+/// `entry` with the enabled bit set or cleared. On the Superlight enabled entries carry
+/// extra 0x00 and disabled ones 0xFF, so that byte is flipped along with the bit.
+pub fn with_enabled(entry: DirEntry, enabled: bool) -> DirEntry {
+    match (enabled, entry.extra) {
+        (true, 0xFF) => DirEntry { flags: entry.flags | 1, extra: 0x00, ..entry },
+        (true, extra) => DirEntry { flags: entry.flags | 1, extra, ..entry },
+        (false, 0x00) => DirEntry { flags: entry.flags & !1, extra: 0xFF, ..entry },
+        (false, extra) => DirEntry { flags: entry.flags & !1, extra, ..entry },
+    }
 }
 
 pub fn is_supported_format(format: u8) -> bool {
@@ -352,9 +357,12 @@ mod tests {
         assert_eq!(build_directory(&e, 255).unwrap(), d);
 
         let mut enabled = e.clone();
-        enabled[2] = enabled_entry(enabled[2]);
+        enabled[2] = with_enabled(enabled[2], true);
         assert_eq!(enabled[2], DirEntry { sector: 3, flags: 1, extra: 0 });
         assert!(crc_ok(&build_directory(&enabled, 255).unwrap()));
+        // Disabling it again gives back the shipped directory
+        enabled[2] = with_enabled(enabled[2], false);
+        assert_eq!(build_directory(&enabled, 255).unwrap(), d);
         let none: Vec<DirEntry> = e.iter().map(|x| DirEntry { flags: 0, ..*x }).collect();
         assert!(build_directory(&none, 255).is_err());
     }

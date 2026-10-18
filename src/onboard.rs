@@ -2,7 +2,8 @@
 //!
 //! Reads use GetInfo, GetMode, GetActiveProfile and Read. State changes:
 //! - SetActiveProfile (`set_active_profile`): immediate, no flash write.
-//! - Sector writes (`write_profile_dpi`, `copy_profile`): StartWrite / WriteData / EndWrite, following
+//! - Sector writes (`write_profile_dpi`, `copy_profile`, `set_profile_enabled`):
+//!   StartWrite / WriteData / EndWrite, following
 //!   the rules in HIDPP_PROTOCOL.md section 8 (whole sector, valid CRC, backup first,
 //!   read-back verify, never ROM sectors).
 
@@ -304,6 +305,63 @@ fn reload_if_active(h: &mut Hidpp, idx: u8, sector: u16) -> Result<bool, String>
     Ok(active)
 }
 
+/// The directory sector with entry `pos` enabled or disabled. Refuses unless the
+/// current directory has a valid CRC and rebuilds byte for byte from its entries.
+fn directory_with(directory: &[u8], entries: &[DirEntry], pos: usize, enabled: bool) -> Result<Vec<u8>, String> {
+    if !profile::crc_ok(directory) {
+        return Err("Refusing to rewrite the directory: its current CRC doesn't match".into());
+    }
+    // Only rewrite a directory we can reproduce exactly; anything else has bytes we'd lose
+    if profile::build_directory(entries, directory.len())? != directory {
+        return Err("Refusing to rewrite the directory: it has data this tool doesn't understand".into());
+    }
+    let mut new_entries = entries.to_vec();
+    new_entries[pos] = profile::with_enabled(new_entries[pos], enabled);
+    profile::build_directory(&new_entries, directory.len())
+}
+
+#[derive(Debug, Clone)]
+pub enum ToggleOutcome {
+    NoChange,
+    Written { sector: u16, enabled: bool, backup: PathBuf },
+    /// Nothing was sent or saved.
+    DryRun { sector: u16, enabled: bool, entry: DirEntry, requests: usize },
+}
+
+/// Enable or disable profile `sector` in the directory. The active profile can't be
+/// disabled, at least one profile stays enabled, and only a profile with a valid CRC
+/// can be enabled.
+pub fn set_profile_enabled(sector: u16, enabled: bool, dry_run: bool) -> Result<ToggleOutcome, String> {
+    let (mut h, _, _, idx) = open()?;
+    let info = read_info(&mut h, idx).map_err(err("GetInfo"))?;
+    let directory = read_sector(&mut h, idx, 0x0000, info.sector_size).map_err(err("Read directory"))?;
+    let entries = profile::parse_directory(&directory);
+    let pos = entries
+        .iter()
+        .position(|e| e.sector == sector)
+        .ok_or_else(|| format!("Profile {sector} is not in the profile directory"))?;
+    if entries[pos].enabled() == enabled {
+        return Ok(ToggleOutcome::NoChange);
+    }
+    if enabled {
+        let data = read_sector(&mut h, idx, sector, info.sector_size)
+            .map_err(err(&format!("Read profile {sector}")))?;
+        if !profile::crc_ok(&data) {
+            return Err(format!("Profile {sector} has no valid data; copy a profile into it first"));
+        }
+    } else if get_active(&mut h, idx)? == sector {
+        return Err(format!("Profile {sector} is active; make another profile active first"));
+    }
+    let new_dir = directory_with(&directory, &entries, pos, enabled)?;
+
+    if dry_run {
+        let entry = profile::parse_directory(&new_dir)[pos];
+        return Ok(ToggleOutcome::DryRun { sector, enabled, entry, requests: write_request_count(new_dir.len()) });
+    }
+    let backup = commit(&mut h, idx, 0x0000, &directory, &new_dir)?;
+    Ok(ToggleOutcome::Written { sector, enabled, backup })
+}
+
 #[derive(Debug, Clone)]
 pub enum CopyOutcome {
     NoChange,
@@ -348,20 +406,7 @@ pub fn copy_profile(source: u16, target: u16, enable_target: bool, dry_run: bool
 
     let copy = old_target != data;
     let enable = enable_target && !entries[target_pos].enabled();
-    let new_dir = if enable {
-        if !profile::crc_ok(&directory) {
-            return Err("Refusing to rewrite the directory: its current CRC doesn't match".into());
-        }
-        // Only rewrite a directory we can reproduce exactly; anything else has bytes we'd lose
-        if profile::build_directory(&entries, size as usize)? != directory {
-            return Err("Refusing to rewrite the directory: it has data this tool doesn't understand".into());
-        }
-        let mut new_entries = entries.clone();
-        new_entries[target_pos] = profile::enabled_entry(new_entries[target_pos]);
-        Some(profile::build_directory(&new_entries, size as usize)?)
-    } else {
-        None
-    };
+    let new_dir = if enable { Some(directory_with(&directory, &entries, target_pos, true)?) } else { None };
     if !copy && !enable {
         return Ok(CopyOutcome::NoChange);
     }
@@ -450,6 +495,15 @@ mod tests {
     fn copy_dry_run() {
         for (source, target, enable) in [(1, 3, true), (1, 3, false), (3, 4, false), (2, 2, true), (1, 99, true)] {
             println!("{source}->{target} enable={enable}: {:?}", super::copy_profile(source, target, enable, true));
+        }
+    }
+
+    /// Dry run only: validates enable/disable against the real mouse but writes nothing.
+    #[test]
+    #[ignore]
+    fn toggle_dry_run() {
+        for (sector, enabled) in [(1, false), (2, false), (3, true), (3, false), (99, true)] {
+            println!("{sector} enabled={enabled}: {:?}", super::set_profile_enabled(sector, enabled, true));
         }
     }
 

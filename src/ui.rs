@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::onboard::{self, CopyOutcome, ProfileSector, Snapshot, SwitchOutcome, WriteOutcome};
+use crate::onboard::{self, CopyOutcome, ProfileSector, Snapshot, SwitchOutcome, ToggleOutcome, WriteOutcome};
 use crate::profile::{self, DPI_MAX, DPI_MIN, DPI_STEP, Profile, decode_button, dpi_text, dpi_used, hex};
 
 const DEVICE_PAGE: &str = "device";
@@ -232,6 +232,85 @@ fn copy_profile(ui: &Rc<Ui>, source: u16, target: u16, enable: bool) {
             ui.toast(&format!("Dry run: would {}; {requests} write requests not sent", plan.join(" and ")));
         }
     });
+}
+
+/// Enable or disable a profile in the directory, then re-read the device.
+fn set_enabled(ui: &Rc<Ui>, sector: u16, enabled: bool) {
+    let dry_run = ui.dry_run;
+    run_op(ui, move || onboard::set_profile_enabled(sector, enabled, dry_run), |ui, outcome| match outcome {
+        ToggleOutcome::NoChange => ui.toast("The directory already has this state"),
+        ToggleOutcome::Written { sector, enabled, backup } => {
+            let verb = if enabled { "Enabled" } else { "Disabled" };
+            ui.toast(&format!(
+                "{verb} profile {sector}. Backup: {}",
+                backup.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            refresh(ui);
+        }
+        ToggleOutcome::DryRun { sector, enabled, entry, requests } => {
+            let verb = if enabled { "enable" } else { "disable" };
+            ui.toast(&format!(
+                "Dry run: would {verb} profile {sector} (flags {:#04x}, extra {:#04x}); {requests} write requests not sent",
+                entry.flags, entry.extra
+            ));
+        }
+    });
+}
+
+/// "Enabled" row with an Enable/Disable button that asks for confirmation first.
+fn enabled_row(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> adw::ActionRow {
+    let sector = p.entry.sector;
+    let enabled = p.entry.enabled();
+    let blocker = if enabled && sector == s.active_sector {
+        Some("This is the active profile; make another profile active first")
+    } else if !enabled && !p.crc_ok {
+        Some("This profile has no valid data; copy a profile into it first")
+    } else {
+        None
+    };
+    let button = gtk::Button::builder()
+        .label(if enabled { "Disable" } else { "Enable" })
+        .valign(gtk::Align::Center)
+        .sensitive(blocker.is_none())
+        .build();
+    let state = if enabled { "Yes" } else { "No" };
+    let subtitle = match blocker {
+        Some(why) => format!("{state}. {why}"),
+        None => format!("{state}. Disabled profiles are skipped when cycling profiles"),
+    };
+    let row = adw::ActionRow::builder().title("Enabled").subtitle(subtitle).use_markup(false).build();
+    row.add_suffix(&button);
+    button.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |button| confirm_enabled(&ui, button.upcast_ref(), sector, !enabled)
+    ));
+    row
+}
+
+fn confirm_enabled(ui: &Rc<Ui>, parent: &gtk::Widget, sector: u16, enabled: bool) {
+    let (heading, body) = if enabled {
+        (format!("Enable Profile {sector}?"), "The mouse can then switch to this profile.")
+    } else {
+        (format!("Disable Profile {sector}?"), "Its settings stay stored, and it can be enabled again later.")
+    };
+    let note = if ui.dry_run {
+        "Dry run: nothing will be written."
+    } else {
+        "This rewrites the profile directory in the mouse's flash memory. A backup is saved first."
+    };
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&format!("{body}\n\n{note}")));
+    let label = if enabled { "Enable" } else { "Disable" };
+    dialog.add_responses(&[("cancel", "Cancel"), ("apply", label)]);
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(Some("apply"), glib::clone!(
+        #[strong]
+        ui,
+        move |_, _| set_enabled(&ui, sector, enabled)
+    ));
+    dialog.present(Some(parent));
 }
 
 fn profile_label(s: &Snapshot, p: &ProfileSector) -> String {
@@ -717,6 +796,7 @@ fn profile_page(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> adw::Preference
     }
     overview.set_header_suffix(Some(&actions));
     overview.add(&info_row("State", state));
+    overview.add(&enabled_row(ui, s, p));
     overview.add(&info_row("Sector", &format!("{sector:#06x}")));
     overview.add(&info_row(
         "Directory entry",
