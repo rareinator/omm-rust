@@ -62,7 +62,7 @@ sudo dnf install cargo gtk4-devel libadwaita-devel
 ## Building and running
 
 ```sh
-git clone <this repo>
+git clone https://github.com/rareinator/omm-rust/tree/main
 cd omm-gui
 cargo run --release                # normal mode
 cargo run --release -- --dry-run   # validate changes, send nothing
