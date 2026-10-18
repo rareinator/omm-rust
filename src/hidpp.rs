@@ -145,6 +145,20 @@ impl Hidpp {
         self.request_timeout(feature, function, params, DEFAULT_TIMEOUT)
     }
 
+    /// The raw report `request` would send (short if params fit in 3 bytes, else long).
+    pub fn encode(&self, feature: u8, function: u8, params: &[u8]) -> Vec<u8> {
+        let (rid, size) = if params.len() <= SHORT_LEN - 4 {
+            (REPORT_SHORT, SHORT_LEN)
+        } else {
+            (REPORT_LONG, LONG_LEN)
+        };
+        assert!(params.len() <= size - 4, "params too long");
+        let mut msg = vec![0u8; size];
+        msg[..4].copy_from_slice(&[rid, self.dev, feature, (function << 4) | SW_ID]);
+        msg[4..4 + params.len()].copy_from_slice(params);
+        msg
+    }
+
     pub fn request_timeout(
         &mut self,
         feature: u8,
@@ -152,16 +166,8 @@ impl Hidpp {
         params: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>> {
-        let (rid, size) = if params.len() <= SHORT_LEN - 4 {
-            (REPORT_SHORT, SHORT_LEN)
-        } else {
-            (REPORT_LONG, LONG_LEN)
-        };
-        assert!(params.len() <= size - 4, "params too long");
         let fn_sw = (function << 4) | SW_ID;
-        let mut msg = vec![0u8; size];
-        msg[..4].copy_from_slice(&[rid, self.dev, feature, fn_sw]);
-        msg[4..4 + params.len()].copy_from_slice(params);
+        let msg = self.encode(feature, function, params);
         self.file.write_all(&msg)?;
 
         let deadline = Instant::now() + timeout;

@@ -4,12 +4,13 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::onboard::{self, ProfileSector, Snapshot};
-use crate::profile::{self, decode_button, dpi_used, hex};
+use crate::onboard::{self, ProfileSector, Snapshot, SwitchOutcome, WriteOutcome};
+use crate::profile::{self, DPI_MAX, DPI_MIN, DPI_STEP, Profile, decode_button, dpi_used, hex};
 
 const DEVICE_PAGE: &str = "device";
 
 struct Ui {
+    toasts: adw::ToastOverlay,
     stack: gtk::Stack,
     status: adw::StatusPage,
     status_button: gtk::Button,
@@ -20,10 +21,12 @@ struct Ui {
     pages: gtk::Stack,
     refresh_button: gtk::Button,
     busy: Cell<bool>,
+    /// Validate actions against the device but don't send anything that changes it.
+    dry_run: bool,
 }
 
-pub fn build(app: &adw::Application) {
-    let ui = Rc::new(build_widgets());
+pub fn build(app: &adw::Application, dry_run: bool) {
+    let ui = Rc::new(build_widgets(dry_run));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -32,7 +35,7 @@ pub fn build(app: &adw::Application) {
         .default_height(640)
         .width_request(360)
         .height_request(300)
-        .content(&ui.stack)
+        .content(&ui.toasts)
         .build();
 
     let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 600sp").unwrap());
@@ -62,7 +65,7 @@ pub fn build(app: &adw::Application) {
     refresh(&ui);
 }
 
-fn build_widgets() -> Ui {
+fn build_widgets(dry_run: bool) -> Ui {
     let spinner = gtk::Spinner::builder().width_request(32).height_request(32).visible(false).build();
     let status_button = gtk::Button::builder()
         .label("Read Device")
@@ -83,11 +86,14 @@ fn build_widgets() -> Ui {
         .build();
     let sidebar_header = adw::HeaderBar::new();
     sidebar_header.pack_start(&refresh_button);
+    if dry_run {
+        sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Profiles", "Dry run")));
+    }
     let sidebar = gtk::ListBox::builder().css_classes(["navigation-sidebar"]).build();
     let sidebar_view = adw::ToolbarView::new();
     sidebar_view.add_top_bar(&sidebar_header);
     sidebar_view.set_content(Some(&gtk::ScrolledWindow::builder().child(&sidebar).vexpand(true).build()));
-    let sidebar_page = adw::NavigationPage::builder().title("Onboard Memory").child(&sidebar_view).build();
+    let sidebar_page = adw::NavigationPage::builder().title("Profiles").child(&sidebar_view).build();
 
     let pages = gtk::Stack::new();
     let content_view = adw::ToolbarView::new();
@@ -100,8 +106,11 @@ fn build_widgets() -> Ui {
     let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
     stack.add_named(&status_view, Some("status"));
     stack.add_named(&split_view, Some("split"));
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&stack));
 
     Ui {
+        toasts,
         stack,
         status,
         status_button,
@@ -112,6 +121,7 @@ fn build_widgets() -> Ui {
         pages,
         refresh_button,
         busy: Cell::new(false),
+        dry_run,
     }
 }
 
@@ -133,7 +143,102 @@ fn refresh(ui: &Rc<Ui>) {
     });
 }
 
+/// Run a device operation on a worker thread, one at a time; errors become toasts.
+fn run_op<T: Send + 'static>(
+    ui: &Rc<Ui>,
+    op: impl FnOnce() -> Result<T, String> + Send + 'static,
+    done: impl FnOnce(&Rc<Ui>, T) + 'static,
+) {
+    if ui.busy.replace(true) {
+        return;
+    }
+    ui.refresh_button.set_sensitive(false);
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(op).await;
+        ui.busy.set(false);
+        ui.refresh_button.set_sensitive(true);
+        match result {
+            Ok(Ok(value)) => done(&ui, value),
+            Ok(Err(msg)) => ui.toast(&msg),
+            Err(_) => ui.toast("The device worker crashed"),
+        }
+    });
+}
+
+/// Send SetActiveProfile, then re-read the device to show the result.
+fn switch_profile(ui: &Rc<Ui>, sector: u16) {
+    let dry_run = ui.dry_run;
+    run_op(ui, move || onboard::set_active_profile(sector, dry_run), |ui, outcome| match outcome {
+        SwitchOutcome::Switched { from, to } => {
+            ui.toast(&format!("Switched from profile {from} to profile {to}"));
+            refresh(ui);
+        }
+        SwitchOutcome::DryRun { to, report } => {
+            ui.toast(&format!("Dry run: would send {} to activate profile {to}", hex(&report)));
+        }
+    });
+}
+
+/// Write the DPI table of a profile, then re-read the device to show the result.
+fn write_dpi(ui: &Rc<Ui>, sector: u16, dpi: [u16; 5]) {
+    let dry_run = ui.dry_run;
+    run_op(ui, move || onboard::write_profile_dpi(sector, dpi, dry_run), |ui, outcome| match outcome {
+        WriteOutcome::NoChange => ui.toast("The device already has these DPI values"),
+        WriteOutcome::Written { sector, changes, backup, reactivated } => {
+            let reload = if reactivated { ", active profile reloaded" } else { "" };
+            ui.toast(&format!(
+                "Profile {sector}: {} written and verified{reload}. Backup: {}",
+                summarize(&changes),
+                backup.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            refresh(ui);
+        }
+        WriteOutcome::DryRun { sector, changes, new_crc, requests } => {
+            ui.toast(&format!(
+                "Dry run: profile {sector} {}, new CRC {new_crc:#06x}; {requests} write requests not sent",
+                summarize(&changes)
+            ));
+        }
+    });
+}
+
+fn summarize(changes: &[onboard::DpiChange]) -> String {
+    changes.iter().map(|c| format!("slot {} {} → {}", c.slot, c.old, c.new)).collect::<Vec<_>>().join(", ")
+}
+
+fn confirm_dpi_write(ui: &Rc<Ui>, parent: &gtk::Widget, sector: u16, original: [u16; 5], dpi: [u16; 5]) {
+    let changes: Vec<String> = (0..5)
+        .filter(|&i| original[i] != dpi[i])
+        .map(|i| format!("Slot {i}: {} → {}", original[i], dpi[i]))
+        .collect();
+    let note = if ui.dry_run {
+        "Dry run: nothing will be written."
+    } else {
+        "This writes the profile to the mouse's flash memory. A backup of the current sector is saved first."
+    };
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Write DPI to Profile {sector}?")),
+        Some(&format!("{}\n\n{note}", changes.join("\n"))),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("write", "Write")]);
+    dialog.set_response_appearance("write", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(Some("write"), glib::clone!(
+        #[strong]
+        ui,
+        move |_, _| write_dpi(&ui, sector, dpi)
+    ));
+    dialog.present(Some(parent));
+}
+
 impl Ui {
+    fn toast(&self, msg: &str) {
+        let toast = adw::Toast::builder().title(glib::markup_escape_text(msg)).timeout(5).build();
+        self.toasts.add_toast(toast);
+    }
+
     fn show_loading(&self) {
         self.refresh_button.set_sensitive(false);
         self.status.set_title("Reading Device…");
@@ -154,7 +259,7 @@ impl Ui {
         self.stack.set_visible_child_name("status");
     }
 
-    fn show_snapshot(&self, s: &Snapshot) {
+    fn show_snapshot(self: &Rc<Self>, s: &Snapshot) {
         self.spinner.stop();
         self.sidebar.remove_all();
         while let Some(child) = self.pages.first_child() {
@@ -176,7 +281,7 @@ impl Ui {
             let name = p.profile.as_ref().and_then(|p| p.name.clone());
             let title = name.unwrap_or_else(|| format!("Profile {sector}"));
             let row = self.add_item(&format!("profile-{sector}"), &title, &tags.join(" · "),
-                                    &profile_page(s, p));
+                                    &profile_page(self, s, p));
             if is_active {
                 active_row = Some(row);
             }
@@ -267,7 +372,131 @@ fn device_page(s: &Snapshot) -> adw::PreferencesPage {
     page
 }
 
-fn profile_page(s: &Snapshot, p: &ProfileSector) -> adw::PreferencesPage {
+/// Header button for the "Profile" group; returns None for the active profile.
+fn activate_button(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> Option<gtk::Button> {
+    let sector = p.entry.sector;
+    if sector == s.active_sector {
+        return None;
+    }
+    let blocker = if !p.entry.enabled() {
+        Some("This profile is disabled in the directory")
+    } else if !p.crc_ok {
+        Some("This profile has no valid data")
+    } else {
+        None
+    };
+    let button = gtk::Button::builder()
+        .label("Make Active")
+        .valign(gtk::Align::Center)
+        .css_classes(["suggested-action"])
+        .sensitive(blocker.is_none())
+        .tooltip_text(blocker.unwrap_or("Switch the mouse to this profile (no flash write)"))
+        .build();
+    button.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |_| switch_profile(&ui, sector)
+    ));
+    Some(button)
+}
+
+/// DPI slots as sliders. Edits stay local until Apply; unused slots are read-only.
+fn dpi_group(ui: &Rc<Ui>, sector: u16, prof: &Profile) -> adw::PreferencesGroup {
+    let g = group("DPI");
+    let original = prof.dpi;
+    let edited = Rc::new(Cell::new(original));
+
+    let revert = gtk::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Revert to the values on the device")
+        .valign(gtk::Align::Center)
+        .sensitive(false)
+        .build();
+    let apply = gtk::Button::builder()
+        .label("Apply")
+        .tooltip_text("Write the DPI table to the mouse")
+        .valign(gtk::Align::Center)
+        .css_classes(["suggested-action"])
+        .sensitive(false)
+        .build();
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header.append(&revert);
+    header.append(&apply);
+    g.set_header_suffix(Some(&header));
+
+    let mut adjustments = Vec::new();
+    for (slot, &v) in original.iter().enumerate() {
+        let mut tags = Vec::new();
+        if slot == prof.default_dpi_slot as usize {
+            tags.push("Default");
+        }
+        if slot == prof.shift_dpi_slot as usize {
+            tags.push("Shift");
+        }
+        let title = format!("Slot {slot}");
+        if !dpi_used(v) {
+            let value = if tags.is_empty() { "Unused".into() } else { format!("Unused ({})", tags.join(", ")) };
+            g.add(&info_row(&title, &value));
+            continue;
+        }
+
+        let adj = gtk::Adjustment::new(v as f64, DPI_MIN as f64, DPI_MAX as f64, DPI_STEP as f64, 400.0, 0.0);
+        let scale = gtk::Scale::builder()
+            .adjustment(&adj)
+            .hexpand(true)
+            .width_request(140)
+            .valign(gtk::Align::Center)
+            .build();
+        let spin = gtk::SpinButton::builder()
+            .adjustment(&adj)
+            .numeric(true)
+            .width_chars(5)
+            .valign(gtk::Align::Center)
+            .build();
+        let row = adw::ActionRow::builder().title(&title).subtitle(tags.join(", ")).use_markup(false).build();
+        row.add_suffix(&scale);
+        row.add_suffix(&spin);
+        g.add(&row);
+
+        adj.connect_value_changed(glib::clone!(
+            #[strong]
+            edited,
+            #[weak]
+            apply,
+            #[weak]
+            revert,
+            move |adj| {
+                let step = DPI_STEP as f64;
+                let snapped = (adj.value() / step).round() * step;
+                if adj.value() != snapped {
+                    adj.set_value(snapped); // re-enters with the snapped value
+                    return;
+                }
+                let mut dpi = edited.get();
+                dpi[slot] = snapped as u16;
+                edited.set(dpi);
+                let changed = dpi != original;
+                apply.set_sensitive(changed);
+                revert.set_sensitive(changed);
+            }
+        ));
+        adjustments.push((slot, adj));
+    }
+
+    revert.connect_clicked(move |_| {
+        for (slot, adj) in &adjustments {
+            adj.set_value(original[*slot] as f64);
+        }
+    });
+    apply.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |button| confirm_dpi_write(&ui, button.upcast_ref(), sector, original, edited.get())
+    ));
+    g
+}
+
+fn profile_page(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     let sector = p.entry.sector;
     let stored = profile::stored_crc(&p.raw);
@@ -279,6 +508,9 @@ fn profile_page(s: &Snapshot, p: &ProfileSector) -> adw::PreferencesPage {
         (false, true) => "Enabled",
         (false, false) => "Disabled",
     };
+    if let Some(button) = activate_button(ui, s, p) {
+        overview.set_header_suffix(Some(&button));
+    }
     overview.add(&info_row("State", state));
     overview.add(&info_row("Sector", &format!("{sector:#06x}")));
     overview.add(&info_row(
@@ -300,20 +532,7 @@ fn profile_page(s: &Snapshot, p: &ProfileSector) -> adw::PreferencesPage {
             };
             overview.add(&info_row("Report rate", &rate));
 
-            let dpi = group("DPI");
-            for (slot, &v) in prof.dpi.iter().enumerate() {
-                let mut tags = Vec::new();
-                if slot == prof.default_dpi_slot as usize {
-                    tags.push("default");
-                }
-                if slot == prof.shift_dpi_slot as usize {
-                    tags.push("shift");
-                }
-                let value = if dpi_used(v) { v.to_string() } else { "Unused".into() };
-                let value = if tags.is_empty() { value } else { format!("{value}  ({})", tags.join(", ")) };
-                dpi.add(&info_row(&format!("Slot {slot}"), &value));
-            }
-            page.add(&dpi);
+            page.add(&dpi_group(ui, sector, prof));
 
             for (title, table) in [("Buttons", &prof.buttons), ("G-Shift Buttons", &prof.gshift_buttons)] {
                 let g = group(title);

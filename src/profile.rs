@@ -112,6 +112,23 @@ pub fn dpi_used(v: u16) -> bool {
     v != 0 && v != 0xFFFF
 }
 
+/// G Pro X Superlight (HERO 25K) sensor range, as used by hidpp_read_profile.py.
+pub const DPI_MIN: u16 = 100;
+pub const DPI_MAX: u16 = 25600;
+pub const DPI_STEP: u16 = 50;
+
+/// Copy of a format 1-4 sector with the DPI table replaced and a fresh CRC.
+pub fn with_dpi(s: &[u8], dpi: &[u16; 5]) -> Vec<u8> {
+    let mut buf = s.to_vec();
+    for (slot, v) in dpi.iter().enumerate() {
+        buf[3 + slot * 2..5 + slot * 2].copy_from_slice(&v.to_le_bytes());
+    }
+    let n = buf.len();
+    let crc = crc16_ccitt(&buf[..n - 2]);
+    buf[n - 2..].copy_from_slice(&crc.to_be_bytes());
+    buf
+}
+
 // Function-execution ids (0x90 xx), from the switch in FUN_18006c010
 const BUTTON_FUNCTIONS: [&str; 18] = [
     "No action", "Tilt left", "Tilt right", "Select next DPI", "Select previous DPI",
@@ -235,6 +252,17 @@ mod tests {
         assert_eq!(decode_button(&p.buttons[0]), "Mouse button: Left");
         assert_eq!(decode_button(&p.buttons[4]), "Mouse button: Forward");
         assert_eq!(decode_button(&p.gshift_buttons[0]), "Default (not remapped)");
+    }
+
+    #[test]
+    fn with_dpi_only_touches_table_and_crc() {
+        let s = superlight_profile();
+        let new = with_dpi(&s, &[3200, 0, 0, 0, 0]);
+        assert!(crc_ok(&new));
+        assert_eq!(&new[3..5], &3200u16.to_le_bytes());
+        let changed: Vec<usize> = (0..s.len()).filter(|&i| s[i] != new[i]).collect();
+        assert!(changed.iter().all(|&i| (3..13).contains(&i) || i >= s.len() - 2), "{changed:?}");
+        assert_eq!(with_dpi(&s, &[6400, 0, 0, 0, 0]), s);
     }
 
     #[test]
