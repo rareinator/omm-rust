@@ -1,3 +1,4 @@
+mod button_editor;
 mod hidpp;
 mod onboard;
 mod profile;

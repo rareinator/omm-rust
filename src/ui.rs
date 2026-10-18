@@ -1,10 +1,11 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::onboard::{self, CopyOutcome, ProfileSector, Snapshot, SwitchOutcome, ToggleOutcome, WriteOutcome};
+use crate::button_editor;
 use crate::profile::{self, DPI_MAX, DPI_MIN, DPI_STEP, Profile, decode_button, dpi_text, dpi_used, hex};
 
 const DEVICE_PAGE: &str = "device";
@@ -183,8 +184,19 @@ fn switch_profile(ui: &Rc<Ui>, sector: u16) {
 /// Write the DPI table of a profile, then re-read the device to show the result.
 fn write_dpi(ui: &Rc<Ui>, sector: u16, dpi: [u16; 5]) {
     let dry_run = ui.dry_run;
-    run_op(ui, move || onboard::write_profile_dpi(sector, dpi, dry_run), |ui, outcome| match outcome {
-        WriteOutcome::NoChange => ui.toast("The device already has these DPI values"),
+    run_op(ui, move || onboard::write_profile_dpi(sector, dpi, dry_run), show_write_outcome);
+}
+
+/// Write both button tables of a profile, then re-read the device to show the result.
+fn write_buttons(ui: &Rc<Ui>, sector: u16, tables: [Vec<[u8; 4]>; 2]) {
+    let dry_run = ui.dry_run;
+    let [buttons, gshift] = tables;
+    run_op(ui, move || onboard::write_profile_buttons(sector, buttons, gshift, dry_run), show_write_outcome);
+}
+
+fn show_write_outcome(ui: &Rc<Ui>, outcome: WriteOutcome) {
+    match outcome {
+        WriteOutcome::NoChange => ui.toast("The device already has these values"),
         WriteOutcome::Written { sector, changes, backup, reactivated } => {
             let reload = if reactivated { ", active profile reloaded" } else { "" };
             ui.toast(&format!(
@@ -200,7 +212,7 @@ fn write_dpi(ui: &Rc<Ui>, sector: u16, dpi: [u16; 5]) {
                 summarize(&changes)
             ));
         }
-    });
+    }
 }
 
 /// Copy one profile over another (optionally enabling it), then re-read the device.
@@ -397,8 +409,8 @@ fn confirm_copy(ui: &Rc<Ui>, parent: &gtk::Widget, sources: &[(u16, String)], ta
     dialog.present(Some(parent));
 }
 
-fn summarize(changes: &[onboard::DpiChange]) -> String {
-    changes.iter().map(|c| format!("slot {} {} → {}", c.slot, dpi_text(c.old), dpi_text(c.new))).collect::<Vec<_>>().join(", ")
+fn summarize(changes: &[String]) -> String {
+    changes.join(", ")
 }
 
 fn confirm_dpi_write(ui: &Rc<Ui>, parent: &gtk::Widget, sector: u16, original: [u16; 5], dpi: [u16; 5]) {
@@ -777,6 +789,165 @@ fn dpi_group(ui: &Rc<Ui>, sector: u16, prof: &Profile) -> adw::PreferencesGroup 
     g
 }
 
+const LAYERS: [&str; 2] = ["Button", "G-Shift"];
+
+/// Both button tables, with an editor per button. Edits stay local until Apply.
+fn buttons_group(ui: &Rc<Ui>, sector: u16, prof: &Profile) -> adw::PreferencesGroup {
+    let g = group("Buttons");
+    let original = [prof.buttons.clone(), prof.gshift_buttons.clone()];
+    let edited = Rc::new(RefCell::new(original.clone()));
+
+    let revert = gtk::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Revert to the buttons on the device")
+        .valign(gtk::Align::Center)
+        .sensitive(false)
+        .build();
+    let apply = gtk::Button::builder()
+        .label("Apply")
+        .tooltip_text("Write the button tables to the mouse")
+        .valign(gtk::Align::Center)
+        .css_classes(["suggested-action"])
+        .sensitive(false)
+        .build();
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header.append(&revert);
+    header.append(&apply);
+    g.set_header_suffix(Some(&header));
+
+    let gshift = adw::ExpanderRow::builder()
+        .title("G-Shift layer")
+        .subtitle("Used while a button set to G-Shift is held")
+        .build();
+    let mut rows = Vec::new();
+    for (layer, table) in original.iter().enumerate() {
+        for slot in 0..table.len() {
+            let title = format!("{slot}: {}", profile::slot_name(slot));
+            let row = adw::ActionRow::builder().title(&title).use_markup(false).subtitle_selectable(true).build();
+            let raw = gtk::Label::builder().css_classes(["monospace", "dim-label"]).build();
+            let edit = gtk::Button::builder()
+                .icon_name("document-edit-symbolic")
+                .tooltip_text("Change what this button does")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            row.add_suffix(&raw);
+            row.add_suffix(&edit);
+            row.set_activatable_widget(Some(&edit));
+            if layer == 0 {
+                g.add(&row);
+            } else {
+                gshift.add_row(&row);
+            }
+            rows.push((layer, slot, title, row, raw, edit));
+        }
+    }
+    g.add(&gshift);
+
+    let sync = Rc::new(glib::clone!(
+        #[strong]
+        edited,
+        #[strong]
+        original,
+        #[weak]
+        g,
+        #[weak]
+        apply,
+        #[weak]
+        revert,
+        #[strong]
+        rows,
+        move || {
+            let tables = edited.borrow();
+            for (layer, slot, _, row, raw, _) in &rows {
+                let (now, was) = (&tables[*layer][*slot], &original[*layer][*slot]);
+                let mut subtitle = decode_button(now);
+                if now != was {
+                    subtitle = format!("{subtitle}  (was: {})", decode_button(was));
+                }
+                row.set_subtitle(&subtitle);
+                raw.set_label(&hex(now));
+            }
+            let changed = *tables != original;
+            let valid = profile::keeps_left_click(&tables[0]);
+            apply.set_sensitive(changed && valid);
+            revert.set_sensitive(changed);
+            g.set_description(if valid { None } else { Some("At least one button must keep left click") });
+        }
+    ));
+    sync();
+
+    for (layer, slot, title, _, _, edit) in &rows {
+        let (layer, slot) = (*layer, *slot);
+        let title = format!("{} {title}", LAYERS[layer]);
+        edit.connect_clicked(glib::clone!(
+            #[strong]
+            edited,
+            #[strong]
+            sync,
+            move |button| {
+                let current = edited.borrow()[layer][slot];
+                button_editor::edit_action(button.upcast_ref(), &title, current, glib::clone!(
+                    #[strong]
+                    edited,
+                    #[strong]
+                    sync,
+                    move |entry| {
+                        edited.borrow_mut()[layer][slot] = entry;
+                        sync();
+                    }
+                ));
+            }
+        ));
+    }
+    revert.connect_clicked(glib::clone!(
+        #[strong]
+        edited,
+        #[strong]
+        original,
+        #[strong]
+        sync,
+        move |_| {
+            *edited.borrow_mut() = original.clone();
+            sync();
+        }
+    ));
+    apply.connect_clicked(glib::clone!(
+        #[strong]
+        ui,
+        move |button| confirm_buttons_write(&ui, button.upcast_ref(), sector, &original, edited.borrow().clone())
+    ));
+    g
+}
+
+fn confirm_buttons_write(ui: &Rc<Ui>, parent: &gtk::Widget, sector: u16, original: &[Vec<[u8; 4]>; 2], tables: [Vec<[u8; 4]>; 2]) {
+    let changes = profile::button_changes([&original[0], &original[1]], [&tables[0], &tables[1]]);
+    let note = if ui.dry_run {
+        "Dry run: nothing will be written."
+    } else {
+        "This writes the profile to the mouse's flash memory. A backup of the current sector is saved first."
+    };
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Write Buttons to Profile {sector}?")),
+        Some(&format!("{}\n\n{note}", changes.join("\n"))),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("write", "Write")]);
+    dialog.set_response_appearance("write", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let tables = RefCell::new(Some(tables));
+    dialog.connect_response(Some("write"), glib::clone!(
+        #[strong]
+        ui,
+        move |_, _| {
+            if let Some(tables) = tables.take() {
+                write_buttons(&ui, sector, tables);
+            }
+        }
+    ));
+    dialog.present(Some(parent));
+}
+
 fn profile_page(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     let sector = p.entry.sector;
@@ -819,15 +990,7 @@ fn profile_page(ui: &Rc<Ui>, s: &Snapshot, p: &ProfileSector) -> adw::Preference
 
             page.add(&dpi_group(ui, sector, prof));
 
-            for (title, table) in [("Buttons", &prof.buttons), ("G-Shift Buttons", &prof.gshift_buttons)] {
-                let g = group(title);
-                for (slot, entry) in table.iter().enumerate() {
-                    let row = info_row(&format!("{slot}: {}", profile::slot_name(slot)), &decode_button(entry));
-                    row.add_suffix(&gtk::Label::builder().label(hex(entry)).css_classes(["monospace", "dim-label"]).build());
-                    g.add(&row);
-                }
-                page.add(&g);
-            }
+            page.add(&buttons_group(ui, sector, prof));
 
             let other = group("Other");
             other.add(&info_row("LED colour (RGB)", &hex(&prof.led_rgb)));

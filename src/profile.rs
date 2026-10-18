@@ -209,17 +209,33 @@ pub fn slot_name(slot: usize) -> String {
 }
 
 /// Name for a HID keyboard usage (page 0x07).
-fn hid_key_name(code: u8) -> String {
+pub fn hid_key_name(code: u8) -> String {
     match code {
         0x04..=0x1D => ((b'A' + code - 0x04) as char).to_string(),
         0x1E..=0x26 => (code - 0x1D).to_string(),
         0x3A..=0x45 => format!("F{}", code - 0x39),
+        0x68..=0x73 => format!("F{}", code - 0x68 + 13),
         0x27 => "0".into(),
         0x28 => "Enter".into(),
         0x29 => "Esc".into(),
         0x2A => "Backspace".into(),
         0x2B => "Tab".into(),
         0x2C => "Space".into(),
+        0x2D => "-".into(),
+        0x2E => "=".into(),
+        0x2F => "[".into(),
+        0x30 => "]".into(),
+        0x31 => "\\".into(),
+        0x33 => ";".into(),
+        0x34 => "'".into(),
+        0x35 => "`".into(),
+        0x36 => ",".into(),
+        0x37 => ".".into(),
+        0x38 => "/".into(),
+        0x39 => "CapsLock".into(),
+        0x46 => "PrintScreen".into(),
+        0x47 => "ScrollLock".into(),
+        0x48 => "Pause".into(),
         0x49 => "Insert".into(),
         0x4A => "Home".into(),
         0x4B => "PageUp".into(),
@@ -232,6 +248,120 @@ fn hid_key_name(code: u8) -> String {
         0x52 => "Up".into(),
         _ => format!("key {code:#04x}"),
     }
+}
+
+/// HID consumer usages offered for buttons (same set as hidpp_read_profile.py).
+pub const CONSUMER_KEYS: [(u16, &str); 7] = [
+    (0x00E9, "Volume up"),
+    (0x00EA, "Volume down"),
+    (0x00E2, "Mute"),
+    (0x00CD, "Play/Pause"),
+    (0x00B5, "Next track"),
+    (0x00B6, "Previous track"),
+    (0x00B7, "Stop"),
+];
+
+/// Keyboard usages that have a name, in HID order.
+pub fn named_keys() -> Vec<(u8, String)> {
+    (0x04..=0x73).map(|c| (c, hid_key_name(c))).filter(|(_, n)| !n.starts_with("key ")).collect()
+}
+
+/// Built-in functions (0x90 xx) offered for buttons. 0x0D (switch to profile index)
+/// is left out: what the index refers to is not verified.
+pub fn button_functions() -> Vec<(u8, &'static str)> {
+    BUTTON_FUNCTIONS.iter().enumerate().filter(|(i, _)| *i != 0x0D).map(|(i, n)| (i as u8, *n)).collect()
+}
+
+pub const MODIFIER_NAMES: [&str; 4] = ["Ctrl", "Shift", "Alt", "Super"];
+
+/// A button action the editor can build. Anything else (macros, combined mouse
+/// buttons, right-hand modifiers, ...) is `Other` and kept byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Default,
+    Mouse(usize),
+    /// Left-hand modifier bits (Ctrl 1, Shift 2, Alt 4, Super 8) and a HID usage.
+    Key { mods: u8, key: u8 },
+    Consumer(u16),
+    Function(u8),
+    Other([u8; 4]),
+}
+
+impl Action {
+    pub fn decode(e: &[u8; 4]) -> Action {
+        if e[0] == 0xFF || (e[0] == 0 && e[1] == 0) {
+            return Action::Default;
+        }
+        match (e[0], e[1]) {
+            (0x80, 1) => {
+                let mask = u16::from_be_bytes([e[2], e[3]]);
+                match (mask.count_ones(), mask.trailing_zeros() as usize) {
+                    (1, bit) if bit < MOUSE_BUTTONS.len() => Action::Mouse(bit),
+                    _ => Action::Other(*e),
+                }
+            }
+            (0x80, 2) if e[2] & 0xF0 == 0 && e[3] != 0 => Action::Key { mods: e[2], key: e[3] },
+            (0x80, 3) => Action::Consumer(u16::from_be_bytes([e[2], e[3]])),
+            (0x90, id) if id != 0x0D && (id as usize) < BUTTON_FUNCTIONS.len() => Action::Function(id),
+            _ => Action::Other(*e),
+        }
+    }
+
+    /// The 4-byte entry, encoded like hidpp_read_profile.py's parse_action.
+    pub fn encode(&self) -> [u8; 4] {
+        match *self {
+            Action::Default => [0xFF; 4],
+            Action::Mouse(bit) => {
+                let m = (1u16 << bit).to_be_bytes();
+                [0x80, 0x01, m[0], m[1]]
+            }
+            Action::Key { mods, key } => [0x80, 0x02, mods, key],
+            Action::Consumer(code) => {
+                let c = code.to_be_bytes();
+                [0x80, 0x03, c[0], c[1]]
+            }
+            Action::Function(id) => [0x90, id, 0x00, 0x00],
+            Action::Other(e) => e,
+        }
+    }
+}
+
+/// Whether the main button table still has a left click: an explicit left-button
+/// mapping on any button, or slot 0 (left on the Superlight) left at its default.
+pub fn keeps_left_click(buttons: &[[u8; 4]]) -> bool {
+    buttons.iter().enumerate().any(|(slot, e)| match Action::decode(e) {
+        Action::Default => slot == 0,
+        Action::Mouse(0) => true,
+        Action::Other([0x80, 0x01, hi, lo]) => u16::from_be_bytes([hi, lo]) & 1 != 0,
+        _ => false,
+    })
+}
+
+/// One line per changed entry between two (buttons, G-Shift) table pairs.
+pub fn button_changes(before: [&[[u8; 4]]; 2], after: [&[[u8; 4]]; 2]) -> Vec<String> {
+    let mut changes = Vec::new();
+    for (layer, name) in ["Button", "G-Shift"].iter().enumerate() {
+        for (slot, (b, a)) in before[layer].iter().zip(after[layer]).enumerate() {
+            if b != a {
+                changes.push(format!("{name} {slot} ({}): {} → {}", slot_name(slot), decode_button(b), decode_button(a)));
+            }
+        }
+    }
+    changes
+}
+
+/// Copy of a format 1-4 sector with both button tables replaced and a fresh CRC.
+pub fn with_buttons(s: &[u8], buttons: &[[u8; 4]], gshift: &[[u8; 4]]) -> Vec<u8> {
+    let mut buf = s.to_vec();
+    for (base, table) in [(BUTTON_TABLE, buttons), (GSHIFT_TABLE, gshift)] {
+        for (slot, e) in table.iter().enumerate().take(MAX_BUTTONS) {
+            buf[base + slot * 4..base + slot * 4 + 4].copy_from_slice(e);
+        }
+    }
+    let n = buf.len();
+    let crc = crc16_ccitt(&buf[..n - 2]);
+    buf[n - 2..].copy_from_slice(&crc.to_be_bytes());
+    buf
 }
 
 /// Decode one 4-byte button entry, as parsed by FUN_18006c740.
@@ -263,7 +393,13 @@ pub fn decode_button(e: &[u8; 4]) -> String {
                 }
                 format!("Key: {}", parts.join("+"))
             }
-            3 => format!("Consumer key {:#06x}", u16::from_be_bytes([e[2], e[3]])),
+            3 => {
+                let code = u16::from_be_bytes([e[2], e[3]]);
+                match CONSUMER_KEYS.iter().find(|(c, _)| *c == code) {
+                    Some((_, name)) => format!("Media key: {name}"),
+                    None => format!("Consumer key {code:#06x}"),
+                }
+            }
             sub => format!("Remap (not sent, opcode {sub})"),
         },
         0x90 => match e[1] {
@@ -330,6 +466,41 @@ mod tests {
     }
 
     #[test]
+    fn actions_round_trip() {
+        for e in [[0x80, 0x01, 0x00, 0x08], [0x80, 0x02, 0x05, 0x06], [0x80, 0x03, 0x00, 0xE9], [0x90, 0x05, 0, 0]] {
+            assert!(!matches!(Action::decode(&e), Action::Other(_)), "{e:?}");
+            assert_eq!(Action::decode(&e).encode(), e);
+        }
+        assert_eq!(Action::decode(&[0xFF; 4]), Action::Default);
+        // Combined buttons, right-hand modifiers and macros are kept as they are
+        for e in [[0x80, 0x01, 0x00, 0x03], [0x80, 0x02, 0x10, 0x06], [0x01, 0x02, 0x00, 0x10]] {
+            assert_eq!(Action::decode(&e), Action::Other(e));
+        }
+        assert_eq!(Action::Key { mods: 1, key: 0x06 }.encode(), [0x80, 0x02, 0x01, 0x06]);
+        assert!(named_keys().iter().any(|(c, n)| *c == 0x68 && n == "F13"));
+    }
+
+    #[test]
+    fn button_edits() {
+        let s = superlight_profile();
+        let p = Profile::decode(&s, 5).unwrap();
+        assert!(keeps_left_click(&p.buttons));
+        let mut b = p.buttons.clone();
+        b[0] = Action::Function(0x03).encode();
+        assert!(!keeps_left_click(&b));
+        b[3] = Action::Mouse(0).encode();
+        assert!(keeps_left_click(&b));
+
+        let mut g = p.gshift_buttons.clone();
+        g[4] = Action::Consumer(0xE9).encode();
+        let new = with_buttons(&s, &b, &g);
+        assert!(crc_ok(&new));
+        let q = Profile::decode(&new, 5).unwrap();
+        assert_eq!((q.buttons, q.gshift_buttons, q.dpi), (b, g, p.dpi));
+        assert_eq!(with_buttons(&s, &p.buttons, &p.gshift_buttons), s);
+    }
+
+    #[test]
     fn dpi_table_rules() {
         assert!(validate_dpi_table(&[6400, 0, 0, 0, 0], 0, 0).is_ok());
         assert!(validate_dpi_table(&[400, 800, 1600, 0, 0], 1, 0).is_ok());
@@ -370,7 +541,8 @@ mod tests {
     #[test]
     fn decodes_button_kinds() {
         assert_eq!(decode_button(&[0x80, 0x02, 0x01, 0x06]), "Key: LCtrl+C");
-        assert_eq!(decode_button(&[0x80, 0x03, 0x00, 0xE9]), "Consumer key 0x00e9");
+        assert_eq!(decode_button(&[0x80, 0x03, 0x00, 0xE9]), "Media key: Volume up");
+        assert_eq!(decode_button(&[0x80, 0x03, 0x01, 0x23]), "Consumer key 0x0123");
         assert_eq!(decode_button(&[0x90, 0x0B, 0, 0]), "G-Shift");
         assert_eq!(decode_button(&[0x90, 0x0D, 2, 0]), "Enable profile at index 2");
     }

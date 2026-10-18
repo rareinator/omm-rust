@@ -222,24 +222,21 @@ fn save_backup(sector: u16, data: &[u8]) -> Result<PathBuf, String> {
 }
 
 #[derive(Debug, Clone)]
-pub struct DpiChange {
-    pub slot: usize,
-    pub old: u16,
-    pub new: u16,
-}
-
-#[derive(Debug, Clone)]
 pub enum WriteOutcome {
     NoChange,
-    Written { sector: u16, changes: Vec<DpiChange>, backup: PathBuf, reactivated: bool },
+    Written { sector: u16, changes: Vec<String>, backup: PathBuf, reactivated: bool },
     /// Nothing was sent or saved; `requests` is how many write requests it would take.
-    DryRun { sector: u16, changes: Vec<DpiChange>, new_crc: u16, requests: usize },
+    DryRun { sector: u16, changes: Vec<String>, new_crc: u16, requests: usize },
 }
 
-/// Replace the DPI table of profile `sector` (`DPI_UNUSED` marks a slot unused). The
-/// sector is re-read from the device, so edits are applied to its current contents,
-/// not to what the GUI showed. The result must pass `validate_dpi_table`.
-pub fn write_profile_dpi(sector: u16, dpi: [u16; 5], dry_run: bool) -> Result<WriteOutcome, String> {
+/// Read-modify-write of profile `sector`. The sector is re-read from the device, so
+/// `edit` works on its current contents, not on what the GUI showed. `edit` returns
+/// the new sector (with CRC) and a description of each change.
+fn edit_profile(
+    sector: u16,
+    dry_run: bool,
+    edit: impl FnOnce(&Profile, &[u8]) -> Result<(Vec<u8>, Vec<String>), String>,
+) -> Result<WriteOutcome, String> {
     if sector == 0 || sector >= ROM_SECTOR_START {
         return Err(format!("Sector {sector:#06x} is not a writable profile sector"));
     }
@@ -257,18 +254,15 @@ pub fn write_profile_dpi(sector: u16, dpi: [u16; 5], dry_run: bool) -> Result<Wr
     if !profile::crc_ok(&old) {
         return Err(format!("Refusing to write: profile {sector}'s current CRC doesn't match"));
     }
+    let current = Profile::decode(&old, info.button_count as usize).ok_or("Sector is too short for the profile layout")?;
 
-    let current = Profile::decode(&old, 0).ok_or("Sector is too short for the profile layout")?;
-    profile::validate_dpi_table(&dpi, current.default_dpi_slot, current.shift_dpi_slot)?;
-    let changes: Vec<DpiChange> = (0..5)
-        .filter(|&slot| current.dpi[slot] != dpi[slot])
-        .map(|slot| DpiChange { slot, old: current.dpi[slot], new: dpi[slot] })
-        .collect();
-    if changes.is_empty() {
+    let (new, changes) = edit(&current, &old)?;
+    if changes.is_empty() || new == old {
         return Ok(WriteOutcome::NoChange);
     }
-    let new = profile::with_dpi(&old, &dpi);
-
+    if !profile::crc_ok(&new) || new.len() != old.len() {
+        return Err("Internal error: edited sector is malformed; nothing written".into());
+    }
     if dry_run {
         return Ok(WriteOutcome::DryRun {
             sector,
@@ -280,6 +274,40 @@ pub fn write_profile_dpi(sector: u16, dpi: [u16; 5], dry_run: bool) -> Result<Wr
     let backup = commit(&mut h, idx, sector, &old, &new)?;
     let reactivated = reload_if_active(&mut h, idx, sector)?;
     Ok(WriteOutcome::Written { sector, changes, backup, reactivated })
+}
+
+/// Replace the DPI table of profile `sector` (`DPI_UNUSED` marks a slot unused).
+/// The result must pass `validate_dpi_table`.
+pub fn write_profile_dpi(sector: u16, dpi: [u16; 5], dry_run: bool) -> Result<WriteOutcome, String> {
+    edit_profile(sector, dry_run, |current, old| {
+        profile::validate_dpi_table(&dpi, current.default_dpi_slot, current.shift_dpi_slot)?;
+        let changes = (0..5)
+            .filter(|&slot| current.dpi[slot] != dpi[slot])
+            .map(|slot| format!("DPI slot {slot} {} → {}", profile::dpi_text(current.dpi[slot]), profile::dpi_text(dpi[slot])))
+            .collect();
+        Ok((profile::with_dpi(old, &dpi), changes))
+    })
+}
+
+/// Replace both button tables of profile `sector`. Each table must have exactly
+/// `button count` entries, and the main table must keep a left click.
+pub fn write_profile_buttons(
+    sector: u16,
+    buttons: Vec<[u8; 4]>,
+    gshift: Vec<[u8; 4]>,
+    dry_run: bool,
+) -> Result<WriteOutcome, String> {
+    edit_profile(sector, dry_run, |current, old| {
+        if buttons.len() != current.buttons.len() || gshift.len() != current.gshift_buttons.len() {
+            return Err(format!("Expected {} buttons per table", current.buttons.len()));
+        }
+        if !profile::keeps_left_click(&buttons) {
+            return Err("At least one button must keep left click".into());
+        }
+        let changes =
+            profile::button_changes([&current.buttons, &current.gshift_buttons], [&buttons, &gshift]);
+        Ok((profile::with_buttons(old, &buttons, &gshift), changes))
+    })
 }
 
 /// Back up `old`, write `new` to `sector`, verify by read-back. Returns the backup path.
@@ -504,6 +532,32 @@ mod tests {
     fn toggle_dry_run() {
         for (sector, enabled) in [(1, false), (2, false), (3, true), (3, false), (99, true)] {
             println!("{sector} enabled={enabled}: {:?}", super::set_profile_enabled(sector, enabled, true));
+        }
+    }
+
+    /// Dry run only: validates button edits against the real mouse but writes nothing.
+    #[test]
+    #[ignore]
+    fn buttons_dry_run() {
+        use crate::profile::Action;
+        let snap = super::read_snapshot().unwrap();
+        let p = snap.profiles.iter().find(|p| p.entry.sector == 2).unwrap().profile.clone().unwrap();
+        let (b, g) = (p.buttons.clone(), p.gshift_buttons.clone());
+        let mut back_to_vol = b.clone();
+        back_to_vol[3] = Action::Consumer(0xE9).encode();
+        let mut no_left = b.clone();
+        no_left[0] = Action::Function(0x03).encode();
+        let mut gs = g.clone();
+        gs[3] = Action::Key { mods: 1, key: 0x06 }.encode();
+        let cases = [
+            ("unchanged", b.clone(), g.clone()),
+            ("back -> volume up", back_to_vol, g.clone()),
+            ("left -> next DPI", no_left, g.clone()),
+            ("g-shift back -> Ctrl+C", b.clone(), gs),
+            ("wrong length", b[..4].to_vec(), g.clone()),
+        ];
+        for (what, b, g) in cases {
+            println!("{what}: {:?}", super::write_profile_buttons(2, b, g, true));
         }
     }
 
