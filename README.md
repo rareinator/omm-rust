@@ -169,8 +169,18 @@ Windows, then tested on real hardware. In short:
   StartWrite/WriteData/EndWrite.
 - Each sector ends with a big-endian CRC-16/CCITT-FALSE.
 
+## License
+
+MIT, see [LICENSE](LICENSE).
+
 ## Disclaimer
 
 This is an unofficial project. It is not affiliated with or endorsed by
-Logitech. "Logitech", "G Pro" and "Lightspeed" are trademarks of Logitech. Use
-at your own risk.
+Logitech. "Logitech", "G Pro" and "Lightspeed" are trademarks of Logitech.
+
+**It has only been tested on one device**, a G Pro X Superlight (1st gen).
+Writing to a mouse's onboard memory can leave it misconfigured or unusable
+("bricked"), especially on untested models. **Use it at your own risk.** The
+author is not responsible for any damage to your device or loss of data. The
+software is provided "as is", without warranty of any kind, as stated in the
+[LICENSE](LICENSE).

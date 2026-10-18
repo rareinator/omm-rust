@@ -1,0 +1,53 @@
+# Builds omm-rust and publishes a GitHub release when a version tag is pushed:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Built on Ubuntu 24.04: it ships the minimum GTK (4.14) and libadwaita (1.5) the
+# app targets, and its older glibc keeps the binary runnable on newer distros.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check tag matches Cargo.toml version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Install GTK4 and libadwaita
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Hardware tests are #[ignore]d, so this needs no mouse
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          name=omm-rust-${GITHUB_REF_NAME}-x86_64-linux
+          mkdir "$name"
+          cp target/release/omm-rust README.md LICENSE "$name"/
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" omm-rust-*.tar.gz omm-rust-*.tar.gz.sha256 \
+            --title "omm-rust $GITHUB_REF_NAME" --generate-notes --prerelease
